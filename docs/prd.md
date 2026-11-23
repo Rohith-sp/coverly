@@ -7,7 +7,7 @@
 | Owner | Rohith |
 | Status | Draft v1 |
 | Target | Day 1: working local MVP (v0). Then v1 and v2 over the following weeks |
-| Repo | `minwatch` (monorepo: `web/` + `api/`) |
+| Repo | `coverly` (monorepo: `web/` + `api/`) |
 
 ---
 
@@ -114,7 +114,7 @@ This is a **weighted set cover** problem, solved with the greedy approximation a
 
 ### F5 — Search
 - For each topic, build **one** query: `"{topic} {module context} tutorial"`, plus `hindi` when language is `hi`.
-- `search.list` with `type=video`, `maxResults=10`, `relevanceLanguage` set from the language setting, `videoCaption=closedCaption` preferred (fall back to any if fewer than 3 results).
+- Exactly **one** `search.list` call per topic (100 units): `type=video`, `maxResults=10`, `relevanceLanguage` set from the language setting. No `videoCaption` filter and no retry search; videos without captions are handled by the F6 fallback instead of a second 100-unit call.
 - Deduplicate video IDs across topics. One video often matches several topics, and that overlap is exactly what set cover exploits.
 
 ### F6 — Metadata and transcripts
@@ -131,7 +131,12 @@ This is a **weighted set cover** problem, solved with the greedy approximation a
     "tags": [ { "topic_id": "sessions-vs-jwt-1f2a", "depth": 2, "confidence": 0.85 } ] }
   ```
   - `depth`: 1 = mentions/introduces, 2 = explains with example, 3 = deep / internals / edge cases
-- Batch several segments per LLM call to save requests.
+- **Keep tagging inside the Groq free tier** (zero cost). Before any LLM call:
+  1. **Cap videos:** per topic, tag only the top `TAG_VIDEOS_PER_TOPIC` (default 5) candidates, ranked by q(s) (section 9.2), which needs only metadata.
+  2. **Keyword pre-filter:** send a segment to the LLM only if its text (or chapter title) contains a word from a plan topic name or its module name (case-insensitive, stop words removed). Segments with no match are not tagged and cannot cover anything.
+  3. **Truncate:** cap segment text at `SEGMENT_TEXT_MAX_CHARS` (default 1500) before sending.
+  4. **Batch:** several segments per call (default `TAG_BATCH_SIZE=8`).
+- Target: a 20-topic run should stay under about 150k tokens. Log tokens used per job next to quota units. Check current Groq free-tier limits (requests/min, tokens/min, tokens/day) in the console before tuning these defaults.
 - Validate JSON against a schema; on failure retry once, then drop that batch and log it.
 
 ### F8 — Scoring and optimization
@@ -142,10 +147,10 @@ Each item:
 - Video title, channel, thumbnail
 - Timestamp range + link: `https://www.youtube.com/watch?v={id}&t={start}s`
 - Topics covered (chips) and depth
-- One-line reason ("Covers JWT + refresh tokens at interview depth in 11 min")
+- One-line reason ("Covers JWT + refresh tokens at interview depth in 11 min"), built from a **template** in v0 (topic names + level + minutes), not an LLM call
 - Consecutive segments of the same video are merged into one range.
 
-Page footer: total watch time, topics covered N/M, list of uncovered topics with the reason (no candidates found / below required depth).
+Page footer: total watch time, topics covered N/M, list of uncovered topics with the reason (no candidates found / below required depth / over budget).
 
 ## 7. Non-functional requirements
 
@@ -182,7 +187,7 @@ api/ (FastAPI)
 **Why FastAPI for the backend:** `youtube-transcript-api` and PDF parsing are best in Python, and FastAPI is already familiar from other projects. Next.js stays as the UI only.
 
 **LLM routing:**
-- Plan parsing and final reasons → larger model (e.g. Llama 3.3 70B on Groq)
+- Plan parsing → larger model (e.g. Llama 3.3 70B on Groq). One call per plan.
 - Segment tagging (high volume) → small fast model (e.g. Llama 3.1 8B on Groq)
 - Check current model names and free-tier limits on the Groq console before coding.
 
@@ -201,7 +206,8 @@ Computed per video, inherited by its segments:
 ```
 engagement = like_count / max(view_count, 1)          → percentile-normalized within candidate pool
 popularity = log10(view_count + 1)                    → normalized
-recency    = 1.0 if published < 3 years, else 0.8     (only for fast-moving topics flagged by the parser)
+recency    = 1.0 in v0 (constant; the parser does not flag fast-moving topics yet)
+             v1: 1.0 if published < 3 years, else 0.8, for topics the parser flags `fast_moving`
 captions   = 1.0 if real transcript, 0.7 if metadata-only
 
 q = 0.5 + (0.4*engagement + 0.3*popularity + 0.2*recency + 0.1*captions)
@@ -219,13 +225,15 @@ The switch penalty encourages finishing coverage inside videos you're already wa
 uncovered = U
 plan = []
 while uncovered not empty:
-    best = argmax over s in S of  |covers(s) ∩ uncovered| / cost(s)
-    if best gains nothing: break                 # remaining topics have no candidate
-    if budget and total_time + dur(best) > budget: break
-    plan.append(best); uncovered -= covers(best)
+    fits = [s for s in S if not budget or total_time + dur(s) <= budget]
+    best = argmax over s in fits of  |covers(s) ∩ uncovered| / cost(s)
+    if best is None or best gains nothing: break  # no candidate left, or nothing fits the budget
+    plan.append(best); uncovered -= covers(best); total_time += dur(best)
     recompute switch penalties
 return plan, uncovered
 ```
+Candidates too long for the remaining budget are skipped, not treated as a stop signal, so a shorter segment can still fill the remaining time. Topics left uncovered because of the budget are reported with reason `over budget`.
+
 Greedy gives a known approximation bound of roughly ln(|U|) against the optimum, and it is fast enough for thousands of segments.
 
 ### 9.5 Post-processing and ordering
@@ -237,11 +245,13 @@ Greedy gives a known approximation bound of roughly ln(|U|) against the optimum,
 
 ### 10.1 YouTube Data API v3 quota
 - Default project quota is **10,000 units/day**; `search.list` costs **100 units**, `videos.list` costs **1 unit** per call (verify current numbers in the Google Cloud console before relying on them).
-- v0 budget per run: 1 search per topic → 40 topics max ≈ 4,000 units + a few `videos.list` calls. That is about 2 large runs per day. Hence the 40-topic cap and caching.
+- v0 budget per run: 1 search per topic → 40 topics max = at most 4,000 units (no retry searches, see F5) + a few `videos.list` calls. That is 2 full-size runs per day, more when the search cache hits. Hence the 40-topic cap and caching.
 - Cache search results by `(query, language)` for 7 days.
 
 ### 10.2 Transcripts
 - `youtube-transcript-api` is unofficial and depends on YouTube's internal endpoints; it can break or be rate-limited, and its use is a terms-of-service grey area. Keep it behind `transcripts.py` with a clean interface so the source can be swapped, and keep the app personal/private until that is resolved.
+- Version 1.x of the library changed its API: it uses an instance (`YouTubeTranscriptApi().fetch(video_id, languages=[...])`) instead of the old static `get_transcript`. Pin the version in `requirements.txt` and check the installed version's README before writing `transcripts.py`.
+- YouTube often blocks transcript requests from cloud/datacenter IPs. Running locally on a home connection works best; a hosted deployment may need a different source (v2 concern).
 
 ### 10.3 LLM (Groq free tier)
 - Respect rate limits with a token-bucket limiter in `llm.py` and exponential backoff on HTTP 429.
@@ -345,10 +355,13 @@ GROQ_API_KEY_1=
 GROQ_API_KEY_2=
 LLM_MODEL_LARGE=llama-3.3-70b-versatile
 LLM_MODEL_SMALL=llama-3.1-8b-instant
-DB_URL=sqlite:///./minwatch.db
+DB_URL=sqlite:///./coverly.db
 MAX_TOPICS=40
 SEARCH_RESULTS_PER_TOPIC=10
 SEGMENT_WINDOW_SECONDS=240
+SEGMENT_TEXT_MAX_CHARS=1500
+TAG_VIDEOS_PER_TOPIC=5
+TAG_BATCH_SIZE=8
 TAG_CONFIDENCE_MIN=0.6
 CORS_ORIGIN=http://localhost:3000
 ```
@@ -362,7 +375,7 @@ CORS_ORIGIN=http://localhost:3000
 | 2 (1.5 h) | `parse.py` + `POST /plans` + review page | Pasted syllabus becomes an editable topic tree |
 | 3 (1.5 h) | `search.py` + metadata batching + search cache | Candidate videos stored for each topic, quota logged |
 | 4 (1.5 h) | `transcripts.py` + `segment.py` (chapters first, windows fallback) | Segments stored for most candidates |
-| 5 (2 h) | `tag.py` with batching, JSON validation, retries | Tags stored with depth + confidence |
+| 5 (2 h) | `tag.py` with video cap, keyword pre-filter, truncation, batching, JSON validation, retries | Tags stored with depth + confidence |
 | 6 (1.5 h) | `score.py` + `cover.py` + ordering/merging | Ordered plan + uncovered list produced in the terminal |
 | 7 (1.5 h) | Job status + progress page + result page | Full flow works in the browser |
 | 8 (0.5 h) | Run on own Backend syllabus, fix the worst issue, write README | Screenshot + first numbers in README |

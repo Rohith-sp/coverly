@@ -3,6 +3,7 @@
 Coverly turns a study plan (text, later PDF/TXT) plus a target level into the **smallest set of YouTube videos and timestamp ranges that covers every topic**, in syllabus order. The core is a greedy weighted set cover over transcript segments.
 
 - Full spec: `docs/prd.md`. Read only the section you need (section numbers below), never the whole file by default.
+- Build plan (agents, waves, quality gate): `docs/PLAN.md`.
 - Session state: `docs/PROGRESS.md`. Read it at the start of every session, update it at the end.
 
 **Current phase: v0** (PRD §4.1). Anything not in §4.1 is out of scope unless I ask for it.
@@ -17,7 +18,7 @@ Coverly turns a study plan (text, later PDF/TXT) plus a target level into the **
 | Backend | Python 3.12 + FastAPI + Uvicorn |
 | DB | SQLite in v0 (`api/coverly.db`), Postgres + pgvector in v1 |
 | Jobs | FastAPI `BackgroundTasks` + `jobs` table in v0; Redis worker in v1 |
-| LLM | Groq API: large model for plan parsing and reasons, small model for segment tagging |
+| LLM | Groq API free tier: large model for plan parsing only, small model for segment tagging; result reasons are templated (no LLM) |
 | External | YouTube Data API v3, `youtube-transcript-api` |
 | Tests | pytest (api), Vitest (web, only where logic exists) |
 | Lint/format | ruff (api), ESLint + Prettier (web) |
@@ -94,6 +95,9 @@ DB_URL=sqlite:///./coverly.db
 MAX_TOPICS=40
 SEARCH_RESULTS_PER_TOPIC=10
 SEGMENT_WINDOW_SECONDS=240
+SEGMENT_TEXT_MAX_CHARS=1500
+TAG_VIDEOS_PER_TOPIC=5
+TAG_BATCH_SIZE=8
 TAG_CONFIDENCE_MIN=0.6
 CORS_ORIGIN=http://localhost:3000
 ```
@@ -110,21 +114,23 @@ Model names come from env only. Never hardcode a model string in code.
 4. **All LLM output is schema-validated** with Pydantic. On failure: retry once, then skip that batch and log it. One bad batch never fails the whole job.
 5. **Partial results over failure.** Missing transcripts, quota errors, or LLM failures reduce coverage and are reported in `uncovered`; the job still finishes.
 6. **YouTube quota is scarce** (search ≈ 100 units, videos.list ≈ 1 unit, default ≈ 10,000/day; verify in the Cloud console):
-   - one `search.list` per topic, max 40 topics per plan
+   - exactly one `search.list` per topic (no caption filter, no retry search), max 40 topics per plan
    - `videos.list` always batched by 50
    - cache search results by `(query, language)` for 7 days; cache metadata and transcripts permanently
    - log quota units used per job
 7. **Transcript access stays inside `transcripts.py`** behind one function, so the source can be swapped. Fallback order: manual captions → auto captions → description chapters → metadata-only (confidence capped at 0.5).
-8. **Secrets stay on the server.** The frontend only talks to our API through `web/lib/api.ts`.
+8. **Zero cost: stay inside the Groq free tier.** Before tagging: tag only the top `TAG_VIDEOS_PER_TOPIC` videos per topic by q(s), keyword pre-filter segments against topic/module names, truncate text to `SEGMENT_TEXT_MAX_CHARS`, batch `TAG_BATCH_SIZE` per call. Log tokens used per job. (PRD §6 F7)
+9. **`youtube-transcript-api` is 1.x:** instance API (`YouTubeTranscriptApi().fetch(...)`), not the old static `get_transcript`. Pin the version.
+10. **Secrets stay on the server.** The frontend only talks to our API through `web/lib/api.ts`.
 
 ## 6. Algorithm constants (PRD §9)
 
 - Level → required depth: `beginner=1`, `interview=2`, `deep=3`
 - A segment covers a topic if `depth ≥ required` and `confidence ≥ TAG_CONFIDENCE_MIN`
 - Beginner plans: depth-3 tags cost +20%
-- `q(s) = 0.5 + 0.4*engagement + 0.3*popularity + 0.2*recency + 0.1*captions` (each term normalized to [0, 1])
+- `q(s) = 0.5 + 0.4*engagement + 0.3*popularity + 0.2*recency + 0.1*captions` (each term normalized to [0, 1]); `recency = 1.0` constant in v0
 - `cost(s) = duration_min / q(s) + switch_penalty` (2 min if the video isn't already selected, else 0)
-- Greedy: pick max `new_covered / cost` until everything is covered, nothing gains, or the budget is hit
+- Greedy: pick max `new_covered / cost` among candidates that still fit the budget; stop when everything is covered or nothing that fits gains anything. Budget-blocked topics are reported as `over budget`
 - Then: prune redundant picks → merge adjacent ranges of the same video → order by earliest syllabus position
 
 If any of these change, update this section and `docs/prd.md` §9 together.
