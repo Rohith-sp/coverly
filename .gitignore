@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Secrets and local data
+.env
+.env.local
+*.db
+*.db-shm
+*.db-wal
+
+# Web
+node_modules/
+.next/
+next-env.d.ts

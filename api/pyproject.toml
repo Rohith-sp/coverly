@@ -1,0 +1,27 @@
+[project]
+name = "coverly-api"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "S", "BLE", "RUF"]
+ignore = ["S101"]  # assert is fine in tests
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+plugins = ["pydantic.mypy"]
+exclude = ["^\\.venv/"]
+
+[[tool.mypy.overrides]]
+module = ["youtube_transcript_api.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
