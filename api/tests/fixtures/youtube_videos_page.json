@@ -1,0 +1,13 @@
+{"items": [
+ {"id": "vid_full",
+  "snippet": {"title": "JWT explained", "channelId": "ch1", "channelTitle": "Chan One",
+              "publishedAt": "2024-03-01T10:00:00Z",
+              "description": "00:00 Intro\n02:30 Tokens\n10:00 Refresh"},
+  "contentDetails": {"duration": "PT1H2M3S"},
+  "statistics": {"viewCount": "1500", "likeCount": "90"}},
+ {"id": "vid_nostats",
+  "snippet": {"title": "No stats", "channelId": "ch2", "channelTitle": "Chan Two",
+              "publishedAt": "2023-01-01T00:00:00Z", "description": ""},
+  "contentDetails": {"duration": "PT45S"},
+  "statistics": {}}
+]}
