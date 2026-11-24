@@ -6,8 +6,10 @@
 - Wave 1: optimizer (`score.py`, `cover.py`), Groq client + plan parsing (`llm.py`, `parse.py`), YouTube search/transcripts/segments, Next.js pages.
 - Wave 2: tagging (`tag.py`: video cap, keyword pre-filter, truncation, batching, closed vocabulary), job runner (`jobs.py`) and all PRD §12 routes plus `GET /plans/{id}`.
 
+- Wave 3: correctness, security and simplicity reviews; all medium+ findings fixed (YouTube key moved to header, one search attempt per topic, per-item failure isolation, transcript timeout, Groq json_validate_failed retry, topic edits 409 during a run, stale jobs reported failed, segment upsert no longer cascades tags, global run + daily quota guards, input length/control-char limits, 413 body limit, generic 502).
+
 ## In progress
-- Wave 3: code review, security review, simplify.
+- Nothing; v0 code complete pending the real run.
 
 ## Next
 - Wave 4 (needs user): real `YOUTUBE_API_KEY` and Groq key(s) in `api/.env`, run the Backend syllabus, record coverage/minutes/run time/quota/tokens in README.
@@ -16,4 +18,6 @@
 - Keyword pre-filter ignores tokens shorter than 3 chars and acronyms not spelled out in the topic name (e.g. "jwt" vs "JSON web tokens").
 - Tags are recomputed on every run (LLM tokens spent on reruns); YouTube quota is fully cached.
 - Tagging progress is per stage, not per batch.
+- No per-IP rate limit on POST /plans (local single-user app); add before any public deploy.
+- A timed-out transcript fetch leaves its worker thread running until the library call returns.
 - Image input is a proposed future feature, not part of the current product requirements.

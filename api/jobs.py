@@ -37,12 +37,32 @@ log = logging.getLogger(__name__)
 
 HTTP_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
 SEARCH_TTL = "-7 days"
+STALE_JOB_MINUTES = 30  # a job with no end older than this is treated as dead (process crashed)
+STALE_MESSAGE = "Job interrupted (server restarted?)"
 _LINES = TypeAdapter(list[TranscriptLine])
 _IDS = TypeAdapter(list[str])
 _VIDEO_COLS = (
     "id, title, channel_id, channel_title, duration_s, views, likes, published_at,"
     " description, has_transcript"
 )
+
+
+def has_active_job(conn: sqlite3.Connection, plan_id: str | None = None) -> bool:
+    """True if a non-stale unfinished job exists (for one plan, or any plan if None)."""
+    row = conn.execute(
+        "SELECT 1 FROM jobs WHERE status NOT IN ('done','failed')"
+        " AND started_at >= datetime('now', ?) AND (? IS NULL OR plan_id = ?)",
+        (f"-{STALE_JOB_MINUTES} minutes", plan_id, plan_id),
+    ).fetchone()
+    return row is not None
+
+
+def quota_used_today(conn: sqlite3.Connection) -> int:
+    """YouTube quota units spent by today's jobs."""
+    row = conn.execute(
+        "SELECT COALESCE(SUM(quota_units), 0) FROM jobs WHERE date(started_at) = date('now')"
+    ).fetchone()
+    return int(row[0])
 
 
 class _Run:
@@ -78,6 +98,12 @@ class _Run:
             self.tokens,
         )
         self._t0 = now
+
+
+def _err(exc: Exception) -> str:
+    """Log-safe error summary: type and HTTP status only (str(exc) can hold URLs/keys)."""
+    status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+    return type(exc).__name__ if status is None else f"{type(exc).__name__} {status}"
 
 
 def _load_topics(conn: sqlite3.Connection, plan_id: str) -> list[Topic]:
@@ -201,8 +227,9 @@ def _store_transcript(conn: sqlite3.Connection, tr: Transcript) -> None:
 
 def _store_segments(conn: sqlite3.Connection, segments: list[Segment]) -> None:
     conn.executemany(
-        "INSERT OR REPLACE INTO segments (id, video_id, start_s, end_s, text, source)"
-        " VALUES (?,?,?,?,?,?)",
+        "INSERT INTO segments (id, video_id, start_s, end_s, text, source) VALUES (?,?,?,?,?,?)"
+        " ON CONFLICT(id) DO UPDATE SET video_id=excluded.video_id, start_s=excluded.start_s,"
+        " end_s=excluded.end_s, text=excluded.text, source=excluded.source",
         [(s.id, s.video_id, s.start_s, s.end_s, s.text, s.source) for s in segments],
     )
     conn.commit()
@@ -269,50 +296,56 @@ async def _fetch_transcripts(
     return have
 
 
-async def _pipeline(
-    run: _Run, client: httpx.AsyncClient, plan: sqlite3.Row, cfg: Settings
-) -> ResultOut:
-    conn = run.conn
-    plan_id: str = plan["id"]
-    level = cast(Level, plan["level"])
-    language = cast(Language, plan["language"])
-    topics = _load_topics(conn, plan_id)
-    notes: list[str] = []
-
-    # searching
+async def _stage_search(
+    run: _Run,
+    client: httpx.AsyncClient,
+    topics: list[Topic],
+    language: Language,
+    cfg: Settings,
+    notes: list[str],
+) -> dict[str, list[str]]:
     run.update("searching", 5, f"Searching {len(topics)} topics")
-    ids_by_topic, misses = _cached_search(conn, topics, language)
+    ids_by_topic, misses = _cached_search(run.conn, topics, language)
     if misses:
         try:
             out = await search.search_topics(
                 client, cfg.youtube_api_key, misses, language, cfg.search_results_per_topic
             )
         except (httpx.HTTPError, search.QuotaExceededError) as exc:
-            log.warning("job_id=%s stage=search error=%s", run.job_id, exc)
+            log.warning("job_id=%s stage=search error=%s", run.job_id, _err(exc))
             notes.append("search failed")
         else:
             run.quota += out.quota_units
             ids_by_topic.update(out.video_ids)
-            _store_search(conn, misses, out.video_ids, language)
+            _store_search(run.conn, misses, out.video_ids, language)
             if out.quota_exceeded:
                 notes.append("YouTube quota exceeded")
     run.update("searching", 20, "Search done")
     run.stage_done("search")
+    return ids_by_topic
 
-    # fetching
+
+async def _stage_fetch(
+    run: _Run,
+    client: httpx.AsyncClient,
+    ids_by_topic: dict[str, list[str]],
+    language: Language,
+    cfg: Settings,
+    notes: list[str],
+) -> tuple[dict[str, Video], dict[str, Transcript]]:
     all_ids = list(dict.fromkeys(v for ids in ids_by_topic.values() for v in ids))
     run.update("fetching", 22, f"Fetching {len(all_ids)} videos")
-    videos = _load_videos(conn, all_ids)
+    videos = _load_videos(run.conn, all_ids)
     missing = [v for v in all_ids if v not in videos]
     if missing:
         try:
             vout = await search.fetch_videos(client, cfg.youtube_api_key, missing)
         except (httpx.HTTPError, search.QuotaExceededError) as exc:
-            log.warning("job_id=%s stage=metadata error=%s", run.job_id, exc)
+            log.warning("job_id=%s stage=metadata error=%s", run.job_id, _err(exc))
             notes.append("video metadata failed")
         else:
             run.quota += vout.quota_units
-            _store_videos(conn, vout.videos)
+            _store_videos(run.conn, vout.videos)
             videos.update({v.id: v for v in vout.videos})
             if vout.quota_exceeded:
                 notes.append("YouTube quota exceeded")
@@ -323,15 +356,18 @@ async def _pipeline(
         for k, v in videos.items()
     }
     run.stage_done("fetch")
+    return videos, trs
 
-    segments: list[Segment] = []
-    for v in videos.values():
-        segments.extend(segment.build_segments(v, trs[v.id], cfg.segment_window_seconds))
-    _store_segments(conn, segments)
-    quality = score.quality_scores(list(videos.values()))
-    chosen = tag.select_segments(topics, ids_by_topic, quality, segments, cfg.tag_videos_per_topic)
 
-    # tagging
+async def _stage_tag(
+    run: _Run,
+    client: httpx.AsyncClient,
+    plan_id: str,
+    topics: list[Topic],
+    chosen: list[Segment],
+    cfg: Settings,
+    notes: list[str],
+) -> list[Tag]:
     run.update("tagging", 45, f"Tagging {len(chosen)} segments")
     tags: list[Tag] = []
     if not cfg.groq_api_keys:
@@ -340,29 +376,60 @@ async def _pipeline(
         try:
             tout = await tag.tag_segments(client, topics, chosen, cfg)
         except (httpx.HTTPError, LLMError) as exc:
-            log.warning("job_id=%s stage=tag error=%s", run.job_id, exc)
+            log.warning("job_id=%s stage=tag error=%s", run.job_id, _err(exc))
             notes.append("tagging failed")
         else:
             tags = tout.tags
             run.tokens += tout.tokens
             if tout.failed_batches:
                 notes.append(f"{tout.failed_batches} tag batches failed")
-    _store_tags(conn, plan_id, tags)
+    _store_tags(run.conn, plan_id, tags)
     run.stage_done("tag")
+    return tags
 
-    # optimizing
+
+def _stage_optimize(
+    run: _Run,
+    plan: sqlite3.Row,
+    topics: list[Topic],
+    segments: list[Segment],
+    tags: list[Tag],
+    quality: dict[str, float],
+    videos: dict[str, Video],
+    cfg: Settings,
+) -> ResultOut:
+    level = cast(Level, plan["level"])
     run.update("optimizing", 85, "Choosing the smallest set of videos")
-    budget = plan["budget_minutes"]
-    res = cover.cover(topics, segments, tags, quality, level, budget, cfg.tag_confidence_min)
-    items = build_items(res.ranges, videos, level)
+    res = cover.cover(
+        topics, segments, tags, quality, level, plan["budget_minutes"], cfg.tag_confidence_min
+    )
     total = round(sum(r.end_s - r.start_s for r in res.ranges) / 60)
     run.stage_done("optimize")
-    result = ResultOut(
-        items=items,
+    return ResultOut(
+        items=build_items(res.ranges, videos, level),
         uncovered=res.uncovered,
         total_minutes=total,
         coverage=Coverage(covered=len(topics) - len(res.uncovered), total=len(topics)),
     )
+
+
+async def _pipeline(
+    run: _Run, client: httpx.AsyncClient, plan: sqlite3.Row, cfg: Settings
+) -> ResultOut:
+    plan_id: str = plan["id"]
+    language = cast(Language, plan["language"])
+    topics = _load_topics(run.conn, plan_id)
+    notes: list[str] = []
+    ids_by_topic = await _stage_search(run, client, topics, language, cfg, notes)
+    videos, trs = await _stage_fetch(run, client, ids_by_topic, language, cfg, notes)
+    segments: list[Segment] = []
+    for v in videos.values():
+        segments.extend(segment.build_segments(v, trs[v.id], cfg.segment_window_seconds))
+    _store_segments(run.conn, segments)
+    quality = score.quality_scores(list(videos.values()))
+    chosen = tag.select_segments(topics, ids_by_topic, quality, segments, cfg.tag_videos_per_topic)
+    tags = await _stage_tag(run, client, plan_id, topics, chosen, cfg, notes)
+    result = _stage_optimize(run, plan, topics, segments, tags, quality, videos, cfg)
     run.message = ("Done. " + "; ".join(notes)) if notes else "Done"
     return result
 

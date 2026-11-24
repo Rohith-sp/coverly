@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { ApiError, getPlan, runPlan, updateTopics, type ModuleIn, type PlanOut } from "@/lib/api";
 import { ErrorBox } from "@/components/ErrorBox";
-import { Loading } from "@/components/Spinner";
+import { Loading } from "@/components/Loading";
 import { btn2Cls, btnCls, inputCls } from "@/components/ui";
 
 const MAX_TOPICS = 40;

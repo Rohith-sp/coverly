@@ -1,4 +1,5 @@
 import json
+import logging
 from collections.abc import Callable
 from pathlib import Path
 
@@ -67,8 +68,10 @@ async def test_one_search_per_topic_and_quota() -> None:
     assert len(seen) == 3
     assert out.quota_units == 300
     assert not out.quota_exceeded
-    assert out.video_ids["t1"] == ["aaa", "bbb"]
+    assert out.video_ids["t1"] == ["aaaaaaaaaaa", "bbbbbbbbbbb"]  # invalid id dropped
     p = seen[0].url.params
+    assert "key" not in p
+    assert seen[0].headers["X-Goog-Api-Key"] == "K"
     assert p["type"] == "video"
     assert p["maxResults"] == "10"
     assert p["relevanceLanguage"] == "hi"
@@ -98,7 +101,9 @@ async def test_videos_batched_by_50() -> None:
         return httpx.Response(200, json={"items": []})
 
     async with _client(handler) as c:
-        out = await search.fetch_videos(c, "K", [f"v{i}" for i in range(120)] + ["v0"])
+        out = await search.fetch_videos(
+            c, "K", [f"v{i:010d}" for i in range(120)] + ["v0000000000"]
+        )
     assert sorted(calls) == [20, 50, 50]
     assert out.quota_units == 3
 
@@ -111,15 +116,18 @@ async def test_video_mapping_and_missing_stats() -> None:
         return httpx.Response(200, json=page)
 
     async with _client(handler) as c:
-        out = await search.fetch_videos(c, "K", ["vid_full", "vid_nostats"])
+        out = await search.fetch_videos(c, "K", ["vidFull0001", "vidNoStat01"])
     full, bare = out.videos
     assert (full.duration_s, full.views, full.likes) == (3723, 1500, 90)
     assert full.channel_title == "Chan One"
     assert (bare.duration_s, bare.views, bare.likes) == (45, 0, 0)
 
 
+VID = "abcdefghijk"
+
+
 @pytest.mark.anyio
-async def test_retry_on_429_then_success() -> None:
+async def test_videos_retry_on_429_then_success_counts_each_attempt() -> None:
     n = 0
 
     def handler(_: httpx.Request) -> httpx.Response:
@@ -130,12 +138,12 @@ async def test_retry_on_429_then_success() -> None:
         return httpx.Response(200, json={"items": []})
 
     async with _client(handler) as c:
-        assert await search.search_topic(c, "K", _topic(), "en", 10) == []
-    assert n == 3
+        out = await search.fetch_videos(c, "K", [VID])
+    assert n == 3 and out.quota_units == 3
 
 
 @pytest.mark.anyio
-async def test_gives_up_after_three_tries() -> None:
+async def test_videos_give_up_after_three_tries() -> None:
     n = 0
 
     def handler(_: httpx.Request) -> httpx.Response:
@@ -144,13 +152,12 @@ async def test_gives_up_after_three_tries() -> None:
         return httpx.Response(503)
 
     async with _client(handler) as c:
-        with pytest.raises(httpx.HTTPStatusError):
-            await search.search_topic(c, "K", _topic(), "en", 10)
-    assert n == 3
+        out = await search.fetch_videos(c, "K", [VID])
+    assert n == 3 and out.videos == [] and out.quota_units == 3
 
 
 @pytest.mark.anyio
-async def test_timeout_retried() -> None:
+async def test_videos_timeout_retried() -> None:
     n = 0
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -161,8 +168,88 @@ async def test_timeout_retried() -> None:
         return httpx.Response(200, json={"items": []})
 
     async with _client(handler) as c:
-        await search.search_topic(c, "K", _topic(), "en", 10)
+        await search.fetch_videos(c, "K", [VID])
     assert n == 2
+
+
+@pytest.mark.parametrize("status", [429, 503])
+@pytest.mark.anyio
+async def test_search_single_attempt_no_retry(status: int) -> None:
+    n = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal n
+        n += 1
+        return httpx.Response(status, json={})
+
+    async with _client(handler) as c:
+        with pytest.raises(httpx.HTTPStatusError):
+            await search.search_topic(c, "K", _topic(), "en", 10)
+    assert n == 1
+
+
+@pytest.mark.anyio
+async def test_search_timeout_not_retried() -> None:
+    n = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal n
+        n += 1
+        raise httpx.ReadTimeout("slow", request=req)
+
+    async with _client(handler) as c:
+        with pytest.raises(httpx.ReadTimeout):
+            await search.search_topic(c, "K", _topic(), "en", 10)
+    assert n == 1
+
+
+@pytest.mark.anyio
+async def test_search_topics_http_error_is_partial_and_key_not_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "JWT 1" in req.url.params["q"]:
+            return httpx.Response(500, json={})
+        return httpx.Response(200, json={"items": [{"id": {"videoId": VID}}]})
+
+    async with _client(handler) as c:
+        out = await search.search_topics(c, "SECRETKEY", [_topic(0), _topic(1)], "en", 10)
+    assert out.video_ids == {"t0": [VID]}
+    assert out.quota_units == 200 and not out.quota_exceeded
+    assert "SECRETKEY" not in caplog.text
+    assert "HTTPStatusError status=500" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_fetch_videos_batch_error_isolated() -> None:
+    page = json.loads((FIX / "youtube_videos_page.json").read_text())
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.params["id"].startswith("x"):
+            return httpx.Response(400, json={})
+        return httpx.Response(200, json=page)
+
+    ids = [f"v{i:010d}" for i in range(50)] + ["x0000000000"]
+    async with _client(handler) as c:
+        out = await search.fetch_videos(c, "K", ids)
+    assert [v.id for v in out.videos] == ["vidFull0001", "vidNoStat01"]
+    assert out.quota_units == 2
+
+
+@pytest.mark.anyio
+async def test_invalid_video_ids_dropped() -> None:
+    seen: list[str] = []
+    item = {"id": "bad", "snippet": {}, "contentDetails": {}, "statistics": {}}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req.url.params["id"])
+        return httpx.Response(200, json={"items": [item]})
+
+    async with _client(handler) as c:
+        out = await search.fetch_videos(c, "K", ["../evil", VID])
+    assert seen == [VID] and out.videos == []
 
 
 def _quota(_: httpx.Request) -> httpx.Response:
@@ -180,10 +267,10 @@ async def test_quota_exceeded_raises_single_call() -> None:
 @pytest.mark.anyio
 async def test_quota_exceeded_partial_outcome() -> None:
     async with _client(_quota) as c:
-        s = await search.search_topics(c, "K", [_topic(0), _topic(1)], "en", 10)
-        v = await search.fetch_videos(c, "K", ["a"])
-    assert s.quota_exceeded and s.quota_units == 0 and s.video_ids == {}
-    assert v.quota_exceeded and v.videos == []
+        s = await search.search_topics(c, "K", [_topic(0)], "en", 10)
+        v = await search.fetch_videos(c, "K", [VID])
+    assert s.quota_exceeded and s.quota_units == 100 and s.video_ids == {}
+    assert v.quota_exceeded and v.videos == [] and v.quota_units == 1
 
 
 @pytest.mark.anyio

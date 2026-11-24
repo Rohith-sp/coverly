@@ -3,6 +3,7 @@
 Only the main session edits this file. Web types in `web/lib/api.ts` mirror the API section.
 """
 
+import unicodedata
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -19,6 +20,12 @@ UncoveredReason = Literal["no candidates found", "below required depth", "over b
 Depth = Literal[1, 2, 3]
 
 REQUIRED_DEPTH: dict[Level, Depth] = {"beginner": 1, "interview": 2, "deep": 3}
+
+
+def _no_control_chars(v: str) -> str:
+    if any(unicodedata.category(c) == "Cc" for c in v):
+        raise ValueError("control characters are not allowed")
+    return v
 
 
 class _Strict(BaseModel):
@@ -61,13 +68,17 @@ class PlanOut(_Strict):
 class TopicIn(_Strict):
     """`topic_id` is None for a topic the user added in the review step."""
 
-    topic_id: str | None = None
+    topic_id: str | None = Field(default=None, pattern=r"^[a-z0-9-]{1,64}$")
     name: str = Field(min_length=1, max_length=200)
+
+    _single_line = field_validator("name")(_no_control_chars)
 
 
 class ModuleIn(_Strict):
     name: str = Field(min_length=1, max_length=200)
     topics: list[TopicIn] = Field(min_length=1)
+
+    _single_line = field_validator("name")(_no_control_chars)
 
 
 class TopicsUpdate(_Strict):
@@ -158,13 +169,15 @@ class _LLM(BaseModel):
 
 
 class ParsedModule(_LLM):
-    name: str = Field(min_length=1)
+    name: str = Field(min_length=1, max_length=200)
     topics: list[str] = Field(min_length=1)
 
     @field_validator("topics")
     @classmethod
     def _non_empty(cls, v: list[str]) -> list[str]:
         cleaned = [t.strip() for t in v if t.strip()]
+        if any(len(t) > 200 for t in cleaned):
+            raise ValueError("topic too long")
         if not cleaned:
             raise ValueError("module has no topics")
         return cleaned
@@ -173,7 +186,7 @@ class ParsedModule(_LLM):
 class ParsedPlan(_LLM):
     """Plan parser output (PRD §6 F3)."""
 
-    title: str = Field(min_length=1)
+    title: str = Field(min_length=1, max_length=200)
     modules: list[ParsedModule] = Field(min_length=1)
 
 

@@ -3,9 +3,9 @@
 import { Suspense, useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
-import { getJob, type JobOut, type JobStatus } from "@/lib/api";
+import { ApiError, getJob, type JobOut, type JobStatus } from "@/lib/api";
 import { ErrorBox } from "@/components/ErrorBox";
-import { Loading } from "@/components/Spinner";
+import { Loading } from "@/components/Loading";
 
 const STAGES: JobStatus[] = ["searching", "fetching", "tagging", "optimizing"];
 
@@ -34,6 +34,8 @@ function Run() {
       } catch (e) {
         if (!alive) return;
         setError(e instanceof Error ? e.message : "Failed to load job.");
+        // 4xx is permanent (bad or unknown job id): stop polling. Network errors and 5xx keep retrying.
+        if (e instanceof ApiError && e.status >= 400 && e.status < 500) return;
       }
       timer = setTimeout(tick, 2000);
     };

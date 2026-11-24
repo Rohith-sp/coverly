@@ -1,6 +1,9 @@
+import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
+import requests
 from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisabled
 
 from pipeline import transcripts
@@ -95,7 +98,7 @@ def _patch(monkeypatch: pytest.MonkeyPatch, **flags: bool) -> None:
 @pytest.mark.anyio
 async def test_manual_preferred(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch(monkeypatch, manual=True, auto=True)
-    t = await fetch_transcript("v", ["en"])
+    t = await fetch_transcript("v", ["en"], asyncio.Semaphore(1))
     assert t.source == "manual"
     assert t.language == "en"
     assert [ln.text for ln in t.lines] == ["hello", "world."]
@@ -104,24 +107,49 @@ async def test_manual_preferred(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.anyio
 async def test_auto_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch(monkeypatch, auto=True)
-    assert (await fetch_transcript("v", ["en"])).source == "auto"
+    assert (await fetch_transcript("v", ["en"], asyncio.Semaphore(1))).source == "auto"
 
 
 @pytest.mark.anyio
 async def test_none_when_no_transcript(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch(monkeypatch)
-    t = await fetch_transcript("v", ["en"])
+    t = await fetch_transcript("v", ["en"], asyncio.Semaphore(1))
     assert (t.source, t.lines, t.language) == ("none", [], None)
 
 
 @pytest.mark.anyio
 async def test_none_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch(monkeypatch, disabled=True)
-    assert (await fetch_transcript("v", ["en"])).source == "none"
+    assert (await fetch_transcript("v", ["en"], asyncio.Semaphore(1))).source == "none"
+
+
+def _raising_api(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
+    class Api:
+        def list(self, video_id: str) -> None:
+            raise exc
+
+    monkeypatch.setattr(transcripts, "YouTubeTranscriptApi", Api)
+
+
+@pytest.mark.parametrize(
+    "exc", [requests.ConnectionError("down"), RuntimeError("parser broke"), KeyError("x")]
+)
+@pytest.mark.anyio
+async def test_none_on_request_or_unexpected_error(
+    monkeypatch: pytest.MonkeyPatch, exc: Exception
+) -> None:
+    _raising_api(monkeypatch, exc)
+    assert (await fetch_transcript("v", ["en"], asyncio.Semaphore(1))).source == "none"
 
 
 @pytest.mark.anyio
-async def test_fetch_many_keeps_order(monkeypatch: pytest.MonkeyPatch) -> None:
-    _patch(monkeypatch, manual=True)
-    out = await transcripts.fetch_transcripts(["a", "b"], ["en"])
-    assert [t.source for t in out] == ["manual", "manual"]
+async def test_none_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    class SlowApi(_FakeApi):
+        def list(self, video_id: str) -> "_FakeApi":
+            time.sleep(0.3)
+            return self
+
+    monkeypatch.setattr(transcripts, "YouTubeTranscriptApi", SlowApi)
+    monkeypatch.setattr(transcripts, "FETCH_TIMEOUT_S", 0.05)
+    t = await fetch_transcript("v", ["en"], asyncio.Semaphore(1))
+    assert t.source == "none"

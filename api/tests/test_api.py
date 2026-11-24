@@ -217,3 +217,84 @@ def test_failed_transcript_not_served_from_cache(conn: sqlite3.Connection) -> No
 
 def test_sync_route_uses_shared_conn(client: TestClient) -> None:
     assert client.get("/health").status_code == 200
+
+
+def _job(conn: sqlite3.Connection, pid: str, status: str, age: str = "0 minutes") -> None:
+    conn.execute(
+        "INSERT INTO jobs (id, plan_id, status, started_at) VALUES (?, ?, ?, datetime('now', ?))",
+        (f"j-{pid}-{status}-{age}", pid, status, f"-{age}"),
+    )
+    conn.commit()
+
+
+def test_edit_topics_409_while_job_active(client: TestClient, conn: sqlite3.Connection) -> None:
+    pid = _plan(client)
+    _job(conn, pid, "tagging")
+    body = {"modules": [{"name": "A", "topics": [{"name": "x"}]}]}
+    assert client.put(f"/plans/{pid}/topics", json=body).status_code == 409
+
+
+def test_stale_job_reported_failed(client: TestClient, conn: sqlite3.Connection) -> None:
+    pid = _plan(client)
+    _job(conn, pid, "tagging", "45 minutes")
+    r = client.get(f"/jobs/j-{pid}-tagging-45 minutes").json()
+    assert r["status"] == "failed" and r["message"] == "Job interrupted (server restarted?)"
+    row = conn.execute("SELECT status FROM jobs").fetchone()
+    assert row["status"] == "failed"
+
+
+def test_other_plans_tags_survive_run(client: TestClient, conn: sqlite3.Connection) -> None:
+    a, b = _plan(client), _plan(client)
+    assert _run(client, a)["status"] == "done"
+    before = conn.execute("SELECT COUNT(*) FROM segment_tags WHERE plan_id=?", (a,)).fetchone()[0]
+    assert before > 0
+    assert _run(client, b)["status"] == "done"
+    after = conn.execute("SELECT COUNT(*) FROM segment_tags WHERE plan_id=?", (a,)).fetchone()[0]
+    assert after == before
+
+
+def test_global_run_guard_and_daily_quota(
+    client: TestClient, conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    a, b = _plan(client), _plan(client)
+    _job(conn, a, "searching")
+    r = client.post(f"/plans/{b}/run")
+    assert r.status_code == 429 and "Another plan" in r.text
+    conn.execute("DELETE FROM jobs")
+    conn.execute(
+        "INSERT INTO jobs (id, plan_id, status, quota_units) VALUES ('old', ?, 'done', 9900)", (a,)
+    )
+    conn.commit()
+    assert client.post(f"/plans/{b}/run").status_code == 429  # 9900 + 2*100 > 10000
+    monkeypatch.setenv("DAILY_QUOTA_LIMIT", "20000")
+    from config import get_settings
+
+    get_settings.cache_clear()
+    assert client.post(f"/plans/{b}/run").status_code == 200
+
+
+def test_tiny_budget_rounds_up(client: TestClient) -> None:
+    pid = _plan(client, budget_hours=0.001)
+    assert client.get(f"/plans/{pid}").json()["budget_hours"] == 1 / 60
+
+
+def test_parse_502_is_generic(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def boom(*_a: object) -> tuple[str, list[ModuleOut], int]:
+        raise llm.LLMRequestError("secret-body http://x")
+
+    monkeypatch.setattr(parse, "parse_plan", boom)
+    r = client.post("/plans", json={"text": "x", "level": "deep", "language": "en"})
+    assert r.status_code == 502 and r.json()["detail"] == "Plan parsing failed, try again"
+
+
+def test_edit_validation_and_body_limit(client: TestClient) -> None:
+    pid = _plan(client)
+    for mod in (
+        {"name": "A\nB", "topics": [{"name": "x"}]},
+        {"name": "A", "topics": [{"name": "x\x00"}]},
+        {"name": "A", "topics": [{"name": "x", "topic_id": "Bad_ID"}]},
+        {"name": "A", "topics": [{"name": "x" * 201}]},
+    ):
+        assert client.put(f"/plans/{pid}/topics", json={"modules": [mod]}).status_code == 422
+    big = {"text": "x" * 120_000, "level": "deep", "language": "en"}
+    assert client.post("/plans", json=big).status_code == 413

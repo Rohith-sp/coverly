@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 TIMEOUT = httpx.Timeout(20.0, connect=5.0)
 TEMPERATURE = 0.1
-MAX_TRIES = 3  # per HTTP request, retries only on 429 / 5xx / timeouts / network errors
+MAX_TRIES = 3  # per HTTP request, retries only on 429 / 5xx / transport errors
 BACKOFF_BASE_S = 1.0  # 1 s, 2 s, ... plus up to 1 s jitter
 MAX_RETRY_AFTER_S = 60.0
 
@@ -40,11 +40,19 @@ class LLMConfigError(LLMError):
 
 
 class LLMRequestError(LLMError):
-    """HTTP request failed (non-retryable status, or retries exhausted)."""
+    """HTTP request failed (non-retryable status, or retries exhausted).
 
-    def __init__(self, message: str, status: int | None = None) -> None:
+    `tokens` counts tokens already spent by earlier calls of the same `complete_json`.
+    """
+
+    def __init__(self, message: str, status: int | None = None, tokens: int = 0) -> None:
         super().__init__(message)
         self.status = status
+        self.tokens = tokens
+
+
+class _JSONValidateFailed(LLMRequestError):
+    """Groq rejected the model's own output as invalid JSON (400 json_validate_failed)."""
 
 
 class LLMValidationError(LLMError):
@@ -120,7 +128,7 @@ async def _post(
                 headers={"Authorization": f"Bearer {key}"},
                 timeout=TIMEOUT,
             )
-        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        except httpx.TransportError as exc:
             reason = f"{type(exc).__name__}"
             status: int | None = None
         else:
@@ -141,6 +149,8 @@ async def _post(
                 _key_index += 1  # rotate to the other key
                 wait = _retry_after(resp)
             elif status < 500:
+                if status == 400 and _error_code(resp) == "json_validate_failed":
+                    raise _JSONValidateFailed("Groq json_validate_failed", status)
                 raise LLMRequestError(f"Groq returned {status}: {resp.text[:200]}", status)
         if attempt == MAX_TRIES:
             raise LLMRequestError(f"Groq failed after {MAX_TRIES} tries: {reason}", status)
@@ -150,6 +160,16 @@ async def _post(
         )
         await _sleep(delay)
     raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _error_code(resp: httpx.Response) -> str | None:
+    try:
+        data = resp.json()
+    except json.JSONDecodeError:
+        return None
+    error = data.get("error") if isinstance(data, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) else None
 
 
 def _content_and_tokens(data: dict[str, object]) -> tuple[str, int]:
@@ -174,8 +194,9 @@ async def complete_json[T: BaseModel](
 ) -> tuple[T, int]:
     """Chat completion in JSON mode, validated against `schema`.
 
-    Returns (object, total tokens). Invalid output is retried once (tokens of both calls count),
-    then `LLMValidationError` is raised.
+    Returns (object, total tokens). Invalid output (including Groq's 400 json_validate_failed)
+    is retried once (tokens of both calls count), then `LLMValidationError` is raised.
+    `LLMRequestError.tokens` carries tokens spent before a request failure.
     """
     settings = settings or get_settings()
     keys = settings.groq_api_keys
@@ -190,7 +211,15 @@ async def complete_json[T: BaseModel](
     total = 0
     error = ""
     for _ in range(2):
-        data = await _post(client, keys, body, model)
+        try:
+            data = await _post(client, keys, body, model)
+        except _JSONValidateFailed:
+            error = "json_validate_failed"
+            log.warning("llm invalid output tier=%s schema=%s: %s", model, schema.__name__, error)
+            continue
+        except LLMRequestError as exc:
+            exc.tokens += total
+            raise
         content, tokens = _content_and_tokens(data)
         total += tokens
         try:

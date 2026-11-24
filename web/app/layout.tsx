@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Suspense } from "react";
 import Link from "next/link";
+import { Loading } from "@/components/Loading";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -19,7 +20,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
             </Link>
           </div>
         </header>
-        <main className="mx-auto w-full max-w-3xl flex-1 px-4 py-8"><Suspense fallback={<p role="status" className="text-sm">Loading...</p>}>{children}</Suspense></main>
+        <main className="mx-auto w-full max-w-3xl flex-1 px-4 py-8"><Suspense fallback={<Loading />}>{children}</Suspense></main>
       </body>
     </html>
   );

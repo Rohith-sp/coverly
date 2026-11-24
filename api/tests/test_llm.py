@@ -167,3 +167,46 @@ async def test_token_bucket_waits_when_empty(llm_env: list[float]) -> None:
     await bucket.acquire()
     await bucket.acquire()
     assert len(llm_env) == 1 and 0.9 < llm_env[0] <= 1.0
+
+
+@pytest.mark.anyio
+async def test_any_transport_error_retried() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.RemoteProtocolError("peer closed", request=request)
+        return ok('{"value": 6}')
+
+    result, _ = await call(handler)
+    assert result.value == 6 and calls == 2
+
+
+def json_validate_failed() -> httpx.Response:
+    body = {"error": {"message": "Failed to generate JSON", "code": "json_validate_failed"}}
+    return httpx.Response(400, json=body)
+
+
+@pytest.mark.anyio
+async def test_json_validate_failed_retried_once() -> None:
+    seen: list[httpx.Request] = []
+    result, tokens = await call(sequence([json_validate_failed(), ok('{"value": 4}', 7)], seen))
+    assert result.value == 4 and tokens == 7 and len(seen) == 2
+
+
+@pytest.mark.anyio
+async def test_json_validate_failed_twice_is_validation_error() -> None:
+    seen: list[httpx.Request] = []
+    with pytest.raises(llm.LLMValidationError) as err:
+        await call(sequence([ok("bad", 9), json_validate_failed()], seen))
+    assert err.value.tokens == 9 and len(seen) == 2
+
+
+@pytest.mark.anyio
+async def test_request_error_carries_tokens() -> None:
+    seen: list[httpx.Request] = []
+    with pytest.raises(llm.LLMRequestError) as err:
+        await call(sequence([ok("bad", 13), httpx.Response(401, text="no")], seen))
+    assert err.value.status == 401 and err.value.tokens == 13

@@ -150,3 +150,27 @@ async def test_failed_batch_counted_others_returned() -> None:
 async def test_empty_input_makes_no_calls() -> None:
     outcome, seen = await run([], tag_all)
     assert outcome == TagOutcome([], 0, 0) and seen == []
+
+
+@pytest.mark.parametrize(
+    ("error", "lost_tokens"),
+    [(httpx.DecodingError("garbled"), 0), (llm.LLMRequestError("down", 503, tokens=7), 7)],
+)
+@pytest.mark.anyio
+async def test_http_or_request_error_skips_only_that_batch(
+    monkeypatch: pytest.MonkeyPatch, error: Exception, lost_tokens: int
+) -> None:
+    real = llm.complete_json
+
+    async def flaky(client: httpx.AsyncClient, *args: object, **kw: object) -> object:
+        user = args[2]
+        if isinstance(user, str) and '"bad_00"' in user:
+            raise error
+        return await real(client, *args, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(llm, "complete_json", flaky)
+    segments = [seg("ok_00"), seg("ok_01"), seg("bad_00"), seg("bad_01")]
+    outcome, seen = await run(segments, tag_all)
+    assert outcome.failed_batches == 1 and len(seen) == 1
+    assert {t.segment_id for t in outcome.tags} == {"ok_00", "ok_01"}
+    assert outcome.tokens == 10 + lost_tokens

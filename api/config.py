@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     llm_model_small: str = ""
     db_url: str = "sqlite:///./coverly.db"
     max_topics: int = 40
+    daily_quota_limit: int = 10000
     search_results_per_topic: int = 10
     segment_window_seconds: int = 240
     segment_text_max_chars: int = 1500

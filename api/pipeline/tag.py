@@ -89,11 +89,16 @@ async def _tag_batch(
         result, tokens = await llm.complete_json(
             client, "small", SYSTEM_PROMPT, user, LLMTagBatch, settings
         )
-    except llm.LLMValidationError as exc:
+    except (llm.LLMValidationError, llm.LLMRequestError) as exc:
         log.warning("tag batch skipped batch=%d segments=%d: %s", index, len(batch), exc)
         return None, exc.tokens
     except llm.LLMError as exc:
         log.warning("tag batch skipped batch=%d segments=%d: %s", index, len(batch), exc)
+        return None, 0
+    except httpx.HTTPError as exc:
+        log.warning(
+            "tag batch skipped batch=%d segments=%d: %s", index, len(batch), type(exc).__name__
+        )
         return None, 0
     topic_ids = {t.topic_id for t in topics}
     by_id = {s.id: s for s in batch}

@@ -1,3 +1,4 @@
+import logging
 import sqlite3
 import uuid
 from typing import Annotated, cast
@@ -23,9 +24,10 @@ from schemas import (
     TopicsUpdate,
 )
 
+log = logging.getLogger(__name__)
 router = APIRouter()
 Conn = Annotated[sqlite3.Connection, Depends(get_conn)]
-STALE_JOB_MINUTES = 30  # a job older than this with no end is treated as dead (process crashed)
+TOPIC_QUOTA_UNITS = 100  # one search.list per topic
 
 
 def _plan_row(conn: sqlite3.Connection, plan_id: str) -> sqlite3.Row:
@@ -66,9 +68,10 @@ async def create_plan(body: PlanCreate, conn: Conn) -> PlanOut:
     except parse.TooManyTopicsError as exc:
         raise HTTPException(422, str(exc)) from exc
     except (llm.LLMError, httpx.HTTPError) as exc:
-        raise HTTPException(502, f"Plan parsing failed: {exc}") from exc
+        log.warning("plan parse failed error=%s", type(exc).__name__)
+        raise HTTPException(502, "Plan parsing failed, try again") from exc
     plan_id = uuid.uuid4().hex
-    budget = None if body.budget_hours is None else round(body.budget_hours * 60)
+    budget = None if body.budget_hours is None else max(1, round(body.budget_hours * 60))
     conn.execute(
         "INSERT INTO plans (id, title, raw_input, level, language, budget_minutes)"
         " VALUES (?,?,?,?,?,?)",
@@ -96,6 +99,8 @@ async def get_plan(plan_id: str, conn: Conn) -> PlanOut:
 @router.put("/plans/{plan_id}/topics")
 async def update_topics(plan_id: str, body: TopicsUpdate, conn: Conn) -> Ok:
     plan = _plan_row(conn, plan_id)
+    if jobs.has_active_job(conn, plan_id):
+        raise HTTPException(409, "A run for this plan is in progress")
     total = sum(len(m.topics) for m in body.modules)
     limit = get_settings().max_topics
     if total > limit:
@@ -125,13 +130,17 @@ async def update_topics(plan_id: str, body: TopicsUpdate, conn: Conn) -> Ok:
 @router.post("/plans/{plan_id}/run")
 async def run_plan(plan_id: str, tasks: BackgroundTasks, conn: Conn) -> RunOut:
     _plan_row(conn, plan_id)
-    busy = conn.execute(
-        "SELECT 1 FROM jobs WHERE plan_id=? AND status NOT IN ('done','failed')"
-        " AND started_at >= datetime('now', ?)",
-        (plan_id, f"-{STALE_JOB_MINUTES} minutes"),
-    ).fetchone()
-    if busy is not None:
+    if jobs.has_active_job(conn, plan_id):
         raise HTTPException(409, "A run for this plan is already in progress")
+    if jobs.has_active_job(conn):
+        raise HTTPException(429, "Another plan is running")
+    count = conn.execute("SELECT COUNT(*) FROM topics WHERE plan_id=?", (plan_id,)).fetchone()[0]
+    used = jobs.quota_used_today(conn)
+    limit = get_settings().daily_quota_limit
+    if used + count * TOPIC_QUOTA_UNITS > limit:
+        raise HTTPException(
+            429, f"Daily YouTube quota too low: {used} of {limit} units used, try again tomorrow"
+        )
     job_id = uuid.uuid4().hex
     conn.execute(
         "INSERT INTO jobs (id, plan_id, status) VALUES (?, ?, 'queued')", (job_id, plan_id)

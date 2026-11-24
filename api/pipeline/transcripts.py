@@ -1,7 +1,8 @@
 """Transcript access and chapter parsing (PRD §6 F6, §10.2).
 
 The only module that imports `youtube-transcript-api` (1.x instance API), so the source can be
-swapped. Fallback: manual captions -> auto captions -> `source="none"`.
+swapped. Fallback: manual captions -> auto captions -> `source="none"`. Each fetch is bounded by
+`FETCH_TIMEOUT_S`; a timed-out worker thread is abandoned (the library has no timeout option).
 """
 
 import asyncio
@@ -9,6 +10,7 @@ import itertools
 import logging
 import re
 
+import requests
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import CouldNotRetrieveTranscript, NoTranscriptFound
 
@@ -17,6 +19,7 @@ from schemas import Language, Transcript, TranscriptLine
 log = logging.getLogger(__name__)
 
 CONCURRENCY = 8
+FETCH_TIMEOUT_S = 30.0
 
 _CHAPTER = re.compile(
     r"^\s*(?:[-*•]\s*)?\(?((?:\d{1,2}:)?\d{1,2}:\d{2})\)?\s*[-\u2013\u2014:|]?\s*(\S.*?)\s*$"
@@ -43,6 +46,12 @@ def _fetch_sync(video_id: str, languages: list[str]) -> Transcript:
         # Covers NoTranscriptFound, TranscriptsDisabled, VideoUnavailable, RequestBlocked, ...
         log.info("stage=transcript video_id=%s none: %s", video_id, type(exc).__name__)
         return _empty(video_id)
+    except requests.RequestException as exc:
+        log.warning("stage=transcript video_id=%s request error: %s", video_id, type(exc).__name__)
+        return _empty(video_id)
+    except Exception as exc:  # noqa: BLE001  # last resort: one video never fails the job
+        log.error("stage=transcript video_id=%s unexpected: %s", video_id, type(exc).__name__)
+        return _empty(video_id)
     lines = [
         TranscriptLine(start_s=s.start, duration_s=s.duration, text=s.text.strip())
         for s in fetched.snippets
@@ -53,18 +62,17 @@ def _fetch_sync(video_id: str, languages: list[str]) -> Transcript:
 
 
 async def fetch_transcript(
-    video_id: str, languages: list[str], sem: asyncio.Semaphore | None = None
+    video_id: str, languages: list[str], sem: asyncio.Semaphore
 ) -> Transcript:
-    """Never raises for missing/blocked transcripts; returns `source="none"` instead."""
-    sem = sem or asyncio.Semaphore(CONCURRENCY)
+    """Never raises for missing/blocked/slow transcripts; returns `source="none"` instead."""
     async with sem:
-        return await asyncio.to_thread(_fetch_sync, video_id, languages)
-
-
-async def fetch_transcripts(video_ids: list[str], languages: list[str]) -> list[Transcript]:
-    """Fetch many transcripts concurrently (semaphore 8), same order as `video_ids`."""
-    sem = asyncio.Semaphore(CONCURRENCY)
-    return list(await asyncio.gather(*(fetch_transcript(v, languages, sem) for v in video_ids)))
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_fetch_sync, video_id, languages), FETCH_TIMEOUT_S
+            )
+        except TimeoutError:
+            log.warning("stage=transcript video_id=%s timeout s=%.0f", video_id, FETCH_TIMEOUT_S)
+            return _empty(video_id)
 
 
 def _to_seconds(stamp: str) -> int:
