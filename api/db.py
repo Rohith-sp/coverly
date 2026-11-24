@@ -104,8 +104,12 @@ CREATE TABLE IF NOT EXISTS results (
 
 
 def connect(path: Path | None = None) -> sqlite3.Connection:
-    """Open a connection with WAL, foreign keys and dict-like rows."""
-    conn = sqlite3.connect(path or get_settings().db_path, timeout=10)
+    """Open a connection with WAL, foreign keys and dict-like rows.
+
+    `check_same_thread=False`: FastAPI may open a request-scoped connection on one thread and use
+    it on another (sync dependency, async endpoint). Each connection still serves one request.
+    """
+    conn = sqlite3.connect(path or get_settings().db_path, timeout=10, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")

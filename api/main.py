@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import db
 from config import get_settings
-from routes import health
+from routes import health, jobs, plans, results
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
@@ -32,3 +32,6 @@ app.add_middleware(
     allow_headers=["Content-Type"],
 )
 app.include_router(health.router)
+app.include_router(plans.router)
+app.include_router(jobs.router)
+app.include_router(results.router)

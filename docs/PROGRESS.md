@@ -1,17 +1,19 @@
 # Progress
 
 ## Done
-- Restored the detailed README at the project root.
-- Moved the project instructions and product requirements into `docs/`, leaving `README.md` as the only Markdown file at the root.
-- Clarified that this checkout currently contains no API or web application source, so the app is not runnable yet.
-- Spec fixes (2026-11-24): zero-cost tagging limits (video cap, keyword pre-filter, truncation, batching), one search per topic with no retry, recency constant in v0, budget-skip greedy, templated reasons, transcript lib 1.x note, `coverly` naming. Root `CLAUDE.md` imports `docs/CLAUDE.md`.
+- Docs: PRD spec fixes, build plan (`docs/PLAN.md`), root `CLAUDE.md` import.
+- Wave 0: contracts (`config.py`, `schemas.py`, `db.py`, `/health`).
+- Wave 1: optimizer (`score.py`, `cover.py`), Groq client + plan parsing (`llm.py`, `parse.py`), YouTube search/transcripts/segments, Next.js pages.
+- Wave 2: tagging (`tag.py`: video cap, keyword pre-filter, truncation, batching, closed vocabulary), job runner (`jobs.py`) and all PRD §12 routes plus `GET /plans/{id}`.
 
 ## In progress
-- Application implementation has not started in this checkout.
+- Wave 3: code review, security review, simplify.
 
 ## Next
-- Scaffold the v0 API and web app, then implement the paste-text-to-watch-plan flow.
-- Revisit free-hosting provider limits and image-input extraction choices before implementing those phases.
+- Wave 4 (needs user): real `YOUTUBE_API_KEY` and Groq key(s) in `api/.env`, run the Backend syllabus, record coverage/minutes/run time/quota/tokens in README.
 
 ## Known issues
+- Keyword pre-filter ignores tokens shorter than 3 chars and acronyms not spelled out in the topic name (e.g. "jwt" vs "JSON web tokens").
+- Tags are recomputed on every run (LLM tokens spent on reruns); YouTube quota is fully cached.
+- Tagging progress is per stage, not per batch.
 - Image input is a proposed future feature, not part of the current product requirements.
